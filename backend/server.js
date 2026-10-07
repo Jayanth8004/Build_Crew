@@ -259,7 +259,7 @@ io.on("connection", (socket) => {
         return;
       }
 
-      const authCheck = await verifyGroupMembership(socket.user._id, groupId, socket.user.role);
+      const authCheck = await verifyGroupMembership(socket.user._id, groupId, socket.user.role, false);
       if (!authCheck.valid) {
         if (typeof callback === "function") {
           callback({ error: authCheck.error || "Access denied: You are not a member of this chat group." });
@@ -295,7 +295,7 @@ io.on("connection", (socket) => {
       }
 
       // Security: verify group membership
-      const authCheck = await verifyGroupMembership(socket.user._id, groupId, socket.user.role);
+      const authCheck = await verifyGroupMembership(socket.user._id, groupId, socket.user.role, false);
       if (!authCheck.valid) {
         if (typeof callback === "function") {
           callback({ error: authCheck.error || "Access denied: You are not a member of this chat group." });
@@ -365,7 +365,7 @@ export const connectDB = async () => {
       throw new Error("MONGODB_URI is not set in environment variables");
     }
     isConnecting = mongoose
-      .connect(mongoURI)
+      .connect(mongoURI, { serverSelectionTimeoutMS: 8000, connectTimeoutMS: 8000 })
       .then(async () => {
         console.log("Connected to MongoDB Atlas");
         try {

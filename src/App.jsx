@@ -519,13 +519,23 @@ export default function App() {
 
         const storedToken = authApi.getToken();
         const authPromise = storedToken
-          ? authApi.getMe().catch(() => {
-              authApi.logout();
-              return null;
+          ? authApi.getMe().catch(error => {
+              if (error.status === 401) {
+                authApi.logout();
+                return null;
+              }
+              return { user: authApi.getStoredUser() };
+            }).then(result => {
+              // Authentication need not wait for every project and builder to load.
+              if (isMounted) {
+                setCurrentUser(result?.user || null);
+                setIsAuthResolving(false);
+              }
+              return result;
             })
           : Promise.resolve(null);
 
-        const bootstrapPromise = fetch(`${API_BASE_URL}/bootstrap`)
+        const bootstrapPromise = fetch(`${API_BASE_URL}/bootstrap`, { signal: AbortSignal.timeout(15000) })
           .then(res => res.ok ? res.json() : null)
           .catch(() => null);
 
@@ -598,9 +608,7 @@ export default function App() {
       navigate('/dashboard', { replace: true });
       showToast(`Welcome back to campus circuit, ${user.name}!`);
     }
-    await fetchUserData();
-    await fetchHackathons();
-    await fetchProjects();
+    await Promise.allSettled([fetchUserData(), fetchHackathons(), fetchProjects()]);
   };
 
   const handleLogout = () => {
@@ -1010,7 +1018,8 @@ export default function App() {
       <div className="fixed inset-0 z-[99999] bg-white flex flex-col items-center justify-center select-none">
         <div className="flex flex-col items-center justify-center p-6 animate-splash">
           <img 
-            src="/buildcrew-splash-logo.png" 
+            src="/buildcrew-splash-logo.png"
+            style={{ filter: 'brightness(1.04)' }}
             alt="BuildCrew" 
             className="w-72 sm:w-96 max-w-[85vw] max-h-[60vh] object-contain select-none" 
           />
@@ -1557,6 +1566,7 @@ export default function App() {
 
       {/* Team Chat Modal */}
       <TeamChatModal
+        key={chatTeam?._id || chatTeam?.id || "closed"}
         team={chatTeam}
         currentUser={currentUser}
         isOpen={Boolean(chatTeam)}

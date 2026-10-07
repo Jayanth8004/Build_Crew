@@ -57,6 +57,7 @@ export async function apiClient(endpoint, options = {}) {
   const config = {
     ...options,
     headers,
+    signal: options.signal || AbortSignal.timeout(15000),
   };
 
   if (options.body && typeof options.body === 'object' && !(options.body instanceof FormData)) {

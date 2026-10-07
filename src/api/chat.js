@@ -23,8 +23,8 @@ export const chatApi = {
    * Fetches messages and member details for a specific group
    * @param {string} groupId
    */
-  getGroupMessages: async (groupId) => {
-    return await apiClient(`/chat/groups/${groupId}/messages`);
+  getGroupMessages: async (groupId, after) => {
+    return await apiClient(`/chat/groups/${groupId}/messages${after ? `?after=${encodeURIComponent(after)}` : ""}`);
   },
 
   /**
@@ -32,10 +32,10 @@ export const chatApi = {
    * @param {string} groupId
    * @param {string} text
    */
-  sendGroupMessage: async (groupId, text) => {
+  sendGroupMessage: async (groupId, text, clientMessageId) => {
     return await apiClient(`/chat/groups/${groupId}/messages`, {
       method: 'POST',
-      body: { text },
+      body: { text, clientMessageId },
     });
   },
 
@@ -85,8 +85,8 @@ export const chatApi = {
    * Fetches existing chat messages and team details from MongoDB
    * @param {string} teamId
    */
-  getTeamMessages: async (teamId) => {
-    return await apiClient(`/chat/${teamId}/messages`);
+  getTeamMessages: async (teamId, after) => {
+    return await apiClient(`/chat/${teamId}/messages${after ? `?after=${encodeURIComponent(after)}` : ""}`);
   },
 
   /**
@@ -94,10 +94,10 @@ export const chatApi = {
    * @param {string} teamId
    * @param {string} text
    */
-  sendMessage: async (teamId, text) => {
+  sendMessage: async (teamId, text, clientMessageId) => {
     return await apiClient(`/chat/${teamId}/messages`, {
       method: 'POST',
-      body: { text },
+      body: { text, clientMessageId },
     });
   },
 

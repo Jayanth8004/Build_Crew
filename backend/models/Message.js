@@ -26,6 +26,7 @@ const messageSchema = new mongoose.Schema(
       trim: true,
       maxlength: [1000, "Maximum message length is 1000 characters"],
     },
+    clientMessageId: { type: String, maxlength: 100 },
     read: {
       type: Boolean,
       default: false,
@@ -43,15 +44,15 @@ messageSchema.index({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 })
 
 // 2. Fast retrieval indexes for conversation history
 messageSchema.index({ conversationId: 1, createdAt: 1 });
-messageSchema.index({ groupId: 1, createdAt: 1 });
-messageSchema.index({ teamId: 1, createdAt: 1 });
+messageSchema.index({ groupId: 1, createdAt: -1, _id: -1 });
+messageSchema.index({ teamId: 1, createdAt: -1, _id: -1 });
 
 /**
  * Storage Protection Helper:
  * Saves a new message and enforces the maximum 500 messages per conversation limit.
  * If more than 500 messages exist for this conversation, removes the oldest messages and retains the newest 500.
  */
-export async function saveAndTrimMessage({ teamId, groupId, senderId, text }) {
+export async function saveAndTrimMessage({ teamId, groupId, senderId, text, clientMessageId }) {
   if (!text || typeof text !== "string") {
     throw new Error("Message text is required.");
   }
@@ -73,32 +74,30 @@ export async function saveAndTrimMessage({ teamId, groupId, senderId, text }) {
     conversationId: convId,
     senderId,
     text: trimmedText,
+    clientMessageId: typeof clientMessageId === "string" ? clientMessageId.slice(0, 100) : undefined,
     read: false,
   });
 
-  // 2. Check and enforce 500-message ceiling per conversation
-  try {
-    const filter = groupId ? { groupId } : { teamId };
-    const totalCount = await Message.countDocuments(filter);
-    if (totalCount > 500) {
-      const excess = totalCount - 500;
+  // Populate the sender and prune in parallel; no full conversation count per send.
+  const trimHistory = async () => {
+    try {
+      const filter = groupId ? { groupId } : { teamId };
       const oldestMessages = await Message.find(filter)
-        .sort({ createdAt: 1 })
-        .limit(excess)
+        .sort({ createdAt: -1, _id: -1 })
+        .skip(500)
         .select("_id")
         .lean();
-
-      if (oldestMessages.length > 0) {
-        const idsToDelete = oldestMessages.map((m) => m._id);
-        await Message.deleteMany({ _id: { $in: idsToDelete } });
+      if (oldestMessages.length) {
+        await Message.deleteMany({ _id: { $in: oldestMessages.map(m => m._id) } });
       }
+    } catch (error) {
+      console.warn("[Storage Protection] Chat message cleanup warning:", error.message);
     }
-  } catch (cleanErr) {
-    console.warn("[Storage Protection] Chat message cleanup warning:", cleanErr.message);
-  }
-
-  // 3. Populate sender information from User model for frontend rendering
-  await message.populate("senderId", "name email avatar profileImage chatUsername role roleTitle college university");
+  };
+  await Promise.all([
+    trimHistory(),
+    message.populate("senderId", "name email avatar profileImage chatUsername role roleTitle college university"),
+  ]);
 
   return message;
 }

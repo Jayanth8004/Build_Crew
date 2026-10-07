@@ -23,7 +23,11 @@ export async function verifyTeamMembership(userId, teamId, userRole = "student")
   const isAdmin = userRole === "admin";
 
   // 1. Check Team model
-  const teamDoc = await Team.findById(teamId);
+  const [teamDoc, projectDoc, hackTeamDoc] = await Promise.all([
+    Team.findById(teamId).select("owner members teamName").lean(),
+    Project.findById(teamId).select("createdBy members title").lean(),
+    HackathonTeam.findById(teamId).select("createdBy members teamName title").lean(),
+  ]);
   if (teamDoc) {
     const isOwner = teamDoc.owner && String(teamDoc.owner) === userObjectIdStr;
     const isMember = Array.isArray(teamDoc.members) && teamDoc.members.some((m) => String(m) === userObjectIdStr);
@@ -54,7 +58,7 @@ export async function verifyTeamMembership(userId, teamId, userRole = "student")
   }
 
   // 2. Check Project model (projects represent collaboration squads)
-  const projectDoc = await Project.findById(teamId);
+
   if (projectDoc) {
     const isOwner = projectDoc.createdBy && String(projectDoc.createdBy) === userObjectIdStr;
     const isMember = Array.isArray(projectDoc.members) && projectDoc.members.some((m) => String(m) === userObjectIdStr);
@@ -85,7 +89,7 @@ export async function verifyTeamMembership(userId, teamId, userRole = "student")
   }
 
   // 3. Check HackathonTeam model (hackathon squads)
-  const hackTeamDoc = await HackathonTeam.findById(teamId);
+
   if (hackTeamDoc) {
     const isOwner = hackTeamDoc.createdBy && String(hackTeamDoc.createdBy) === userObjectIdStr;
     const isMember = Array.isArray(hackTeamDoc.members) && hackTeamDoc.members.some((m) => String(m) === userObjectIdStr);
@@ -126,7 +130,7 @@ export async function verifyTeamMembership(userId, teamId, userRole = "student")
  * @param {string} [userRole]
  * @returns {Promise<{ valid: boolean, error?: string, group?: any, isGroupAdmin?: boolean }>}
  */
-export async function verifyGroupMembership(userId, groupId, userRole = "student") {
+export async function verifyGroupMembership(userId, groupId, userRole = "student", populate = true) {
   if (!groupId || !mongoose.Types.ObjectId.isValid(groupId)) {
     return { valid: false, error: "Invalid group identifier." };
   }
@@ -134,9 +138,12 @@ export async function verifyGroupMembership(userId, groupId, userRole = "student
   const userObjectIdStr = String(userId);
   const isAdmin = userRole === "admin";
 
-  const group = await ChatGroup.findById(groupId)
-    .populate("admin", "name email avatar profileImage chatUsername role roleTitle college university")
-    .populate("members", "name email avatar profileImage chatUsername role roleTitle college university");
+  const query = ChatGroup.findById(groupId);
+  if (populate) {
+    query.populate("admin", "name email avatar profileImage chatUsername role roleTitle college university")
+      .populate("members", "name email avatar profileImage chatUsername role roleTitle college university");
+  }
+  const group = await query.lean();
 
   if (!group) {
     return { valid: false, error: "Group not found." };
@@ -171,6 +178,7 @@ export async function getUserFormedTeams(userId) {
     Project.find({
       $or: [{ createdBy: userObjectId }, { members: userObjectId }],
     })
+      .select("createdBy members title teamName categoryBadge track")
       .populate("createdBy", "name email avatar profileImage chatUsername role roleTitle college university")
       .populate("members", "name email avatar profileImage chatUsername role roleTitle college university")
       .lean(),
@@ -178,6 +186,7 @@ export async function getUserFormedTeams(userId) {
     HackathonTeam.find({
       $or: [{ createdBy: userObjectId }, { members: userObjectId }],
     })
+      .select("createdBy members title teamName categoryBadge track")
       .populate("createdBy", "name email avatar profileImage chatUsername role roleTitle college university")
       .populate("members", "name email avatar profileImage chatUsername role roleTitle college university")
       .lean(),
@@ -185,6 +194,7 @@ export async function getUserFormedTeams(userId) {
     Team.find({
       $or: [{ owner: userObjectId }, { members: userObjectId }],
     })
+      .select("owner members teamName")
       .populate("owner", "name email avatar profileImage chatUsername role roleTitle college university")
       .populate("members", "name email avatar profileImage chatUsername role roleTitle college university")
       .lean(),

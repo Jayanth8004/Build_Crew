@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { getSocket } from '../utils/socket';
 import { chatApi } from '../api/chat';
+import { mergeMessages, subscribeChat } from '../utils/chatSync';
 
 export default function TeamChatModal({ team, currentUser, isOpen, onClose }) {
   const [messages, setMessages] = useState([]);
@@ -29,42 +30,23 @@ export default function TeamChatModal({ team, currentUser, isOpen, onClose }) {
     let isMounted = true;
     const socket = getSocket();
 
-    const fetchHistory = async () => {
-      setIsLoading(true);
-      setLoadError(null);
-      setSendError(null);
-      try {
-        const data = await chatApi.getTeamMessages(teamId);
-        if (!isMounted) return;
-        setMessages(data.messages || []);
-        if (data.teamName || data.members) {
-          setTeamDetails({
-            teamName: data.teamName || team.teamName || team.title,
-            members: data.members || team.members || [],
-          });
-        }
-      } catch (err) {
-        if (!isMounted) return;
-        console.error('Failed to load chat history:', err);
-        setLoadError(err.message || 'Could not load chat history.');
-      } finally {
-        if (isMounted) setIsLoading(false);
-      }
-    };
-
-    fetchHistory().then(() => {
-      if (isMounted) {
-        setTimeout(() => scrollToBottom(false), 50);
-      }
-    });
-
-    // 2. Join Socket.IO team room
-    socket.emit('join_team', { teamId }, (response) => {
-      if (response?.error) {
-        if (isMounted) {
-          setLoadError(response.error);
-        }
-      }
+    // Clear the previous room before subscribing to this conversation.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setMessages([]);
+    setTeamDetails(null);
+    setIsLoading(true);
+    setLoadError(null);
+    setSendError(null);
+    const unsubscribe = subscribeChat({
+      socket, kind: 'team', id: teamId,
+      load: after => chatApi.getTeamMessages(teamId, after),
+      onData: data => {
+        setMessages(previous => mergeMessages(previous, data.messages || []));
+        setTeamDetails({ teamName: data.teamName, members: data.members || [] });
+        setIsLoading(false);
+        setLoadError(null);
+      },
+      onError: error => { setLoadError(error.message); setIsLoading(false); },
     });
 
     // 3. Listen for real-time incoming messages broadcasted via Socket.IO
@@ -76,7 +58,7 @@ export default function TeamChatModal({ team, currentUser, isOpen, onClose }) {
           if (prev.some((m) => String(m._id) === String(newMessage._id))) {
             return prev;
           }
-          return [...prev, newMessage];
+          return mergeMessages(prev, [newMessage]);
         });
         setTimeout(() => {
           if (isMounted) scrollToBottom(true);
@@ -93,10 +75,10 @@ export default function TeamChatModal({ team, currentUser, isOpen, onClose }) {
 
     return () => {
       isMounted = false;
-      socket.emit('leave_team', { teamId });
+      unsubscribe();
       socket.off('new_message', handleNewMessage);
     };
-  }, [isOpen, teamId, team, scrollToBottom]);
+  }, [isOpen, teamId, scrollToBottom]);
 
   // Scroll to bottom when message list changes
   useEffect(() => {
@@ -119,46 +101,19 @@ export default function TeamChatModal({ team, currentUser, isOpen, onClose }) {
 
     setIsSending(true);
     setSendError(null);
-
-    const socket = getSocket();
-
-    // Primary real-time flow: send via Socket.IO with acknowledgment
-    if (socket && socket.connected) {
-      socket.timeout(6000).emit('send_message', { teamId, text: trimmed }, (err, response) => {
-        if (err || response?.error || !response?.success) {
-          console.warn('[Socket.IO] Send failed, trying REST fallback:', err || response?.error);
-          // Fallback to REST API if socket acknowledgment timed out
-          fallbackRestSend(trimmed);
-        } else {
-          setInputText('');
-          setIsSending(false);
-          setSendError(null);
-        }
-      });
-    } else {
-      // If socket is disconnected, use REST API directly
-      fallbackRestSend(trimmed);
-    }
-  };
-
-  const fallbackRestSend = async (textToSend) => {
+    setInputText('');
+    const clientMessageId = `pending-${crypto.randomUUID()}`;
+    setMessages(previous => mergeMessages(previous, [{
+      _id: clientMessageId, clientMessageId, senderId: currentUser,
+      text: trimmed, createdAt: new Date().toISOString(), pending: true,
+    }]));
     try {
-      const res = await chatApi.sendMessage(teamId, textToSend);
-      if (res?.message) {
-        setMessages((prev) => {
-          if (prev.some((m) => String(m._id) === String(res.message._id))) {
-            return prev;
-          }
-          return [...prev, res.message];
-        });
-        setInputText('');
-        setSendError(null);
-      } else {
-        setSendError('Message could not be sent. Please try again.');
-      }
-    } catch (err) {
-      console.error('REST chat send error:', err);
-      setSendError('Message could not be sent. Please try again.');
+      const res = await chatApi.sendMessage(teamId, trimmed, clientMessageId);
+      setMessages(previous => mergeMessages(previous, [res.message]));
+    } catch {
+      setMessages(previous => previous.filter(message => message._id !== clientMessageId));
+      setInputText(previous => previous || trimmed);
+      setSendError('Message could not be confirmed. Check the chat before retrying.');
     } finally {
       setIsSending(false);
     }
@@ -205,7 +160,7 @@ export default function TeamChatModal({ team, currentUser, isOpen, onClose }) {
                 </h2>
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-semibold shrink-0">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                  Live Chat
+                  Text Chat
                 </span>
               </div>
               <p className="font-body-sm text-xs text-on-surface-variant truncate">
@@ -314,7 +269,7 @@ export default function TeamChatModal({ team, currentUser, isOpen, onClose }) {
               </div>
               <h3 className="font-headline-sm text-sm font-bold text-on-surface">{loadError}</h3>
               <p className="font-body-sm text-xs text-on-surface-variant max-w-xs">
-                You must be an accepted member or leader of this team to access team messages.
+                Reconnecting automatically. Check your connection and team membership if this continues.
               </p>
               <button
                 type="button"
@@ -331,7 +286,7 @@ export default function TeamChatModal({ team, currentUser, isOpen, onClose }) {
               </div>
               <p className="font-headline-sm text-sm font-bold text-on-surface">No messages yet</p>
               <p className="font-body-sm text-xs max-w-sm text-on-surface-variant">
-                Say hello to your squad! Messages sent here are instantly visible to all team members.
+                Say hello to your squad! New messages appear automatically for all team members.
               </p>
             </div>
           ) : (
@@ -393,7 +348,7 @@ export default function TeamChatModal({ team, currentUser, isOpen, onClose }) {
                   <div className="flex items-center gap-1 mt-0.5 px-1">
                     <span className="text-[10px] text-outline font-medium">
                       {isMe ? 'You • ' : ''}
-                      {formatTime(msg.createdAt)}
+                      {msg.pending ? 'Sending…' : formatTime(msg.createdAt)}
                     </span>
                   </div>
                 </div>
@@ -436,7 +391,7 @@ export default function TeamChatModal({ team, currentUser, isOpen, onClose }) {
                   if (sendError) setSendError(null);
                 }}
                 onKeyDown={handleKeyDown}
-                disabled={isSending || isLoading || Boolean(loadError)}
+                disabled={isLoading || Boolean(loadError)}
                 maxLength={1000}
                 placeholder={
                   loadError

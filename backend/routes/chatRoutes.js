@@ -92,7 +92,6 @@ router.get("/groups", authenticateUser, async (req, res) => {
       $or: [{ members: userId }, { admin: userId }],
     })
       .populate("admin", "name email avatar profileImage chatUsername role roleTitle college university")
-      .populate("members", "name email avatar profileImage chatUsername role roleTitle college university")
       .sort({ updatedAt: -1 })
       .lean();
 
@@ -203,16 +202,17 @@ router.get("/groups/:groupId/messages", authenticateUser, async (req, res) => {
     }
 
     // Fetch messages for this group (max 500 messages, 30-day TTL index applied)
-    const messages = await Message.find({ groupId })
+    const messages = await Message.find({ groupId, ...(req.query.after && !isNaN(Date.parse(req.query.after)) ? { createdAt: { $gte: new Date(req.query.after) } } : {}) })
       .populate("senderId", "name email avatar profileImage chatUsername role roleTitle college university")
-      .sort({ createdAt: 1 })
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(500)
       .lean();
 
     return res.json({
       success: true,
       groupId,
       group: authCheck.group,
-      messages,
+      messages: messages.reverse(),
       isGroupAdmin: authCheck.isGroupAdmin,
     });
   } catch (err) {
@@ -225,9 +225,9 @@ router.get("/groups/:groupId/messages", authenticateUser, async (req, res) => {
 router.post("/groups/:groupId/messages", authenticateUser, async (req, res) => {
   try {
     const { groupId } = req.params;
-    const { text } = req.body;
+    const { text, clientMessageId } = req.body;
 
-    const authCheck = await verifyGroupMembership(req.user._id, groupId, req.user.role);
+    const authCheck = await verifyGroupMembership(req.user._id, groupId, req.user.role, false);
     if (!authCheck.valid) {
       return res.status(403).json({ error: authCheck.error });
     }
@@ -246,6 +246,7 @@ router.post("/groups/:groupId/messages", authenticateUser, async (req, res) => {
       groupId,
       senderId: req.user._id,
       text,
+      clientMessageId,
     });
 
     // Update lastMessage on ChatGroup
@@ -299,13 +300,19 @@ router.post("/groups/:groupId/members", authenticateUser, async (req, res) => {
     const group = authCheck.group;
 
     // If group has teamId, verify that the added members belong to that team
-    let validMemberIdsToAdd = memberIds;
+    let validMemberIdsToAdd = [];
+    if (!group.teamId) return res.status(400).json({ error: "This group is not linked to a team." });
     if (group.teamId) {
       const teamCheck = await verifyTeamMembership(req.user._id, group.teamId, req.user.role);
+      if (!teamCheck.valid) return res.status(403).json({ error: teamCheck.error });
       if (teamCheck.valid) {
         const allowed = new Set((teamCheck.members || []).map((m) => String(m._id || m)));
         validMemberIdsToAdd = memberIds.filter((id) => allowed.has(String(id)));
       }
+    }
+
+    if (validMemberIdsToAdd.length !== memberIds.length) {
+      return res.status(400).json({ error: "Only current team members can be added." });
     }
 
     const updatedGroup = await ChatGroup.findByIdAndUpdate(
@@ -322,7 +329,9 @@ router.post("/groups/:groupId/members", authenticateUser, async (req, res) => {
     // Broadcast update via Socket.IO
     const io = req.app.get("io");
     if (io) {
-      io.to(`group:${groupId}`).emit("group_members_updated", updatedGroup);
+      for (const member of updatedGroup.members) {
+        io.to(`user:${member._id}`).emit("group_members_updated", updatedGroup);
+      }
     }
 
     return res.json({
@@ -392,9 +401,10 @@ router.get("/:teamId/messages", authenticateUser, async (req, res) => {
       return res.status(403).json({ error: authCheck.error || "Access denied: You are not a member of this team." });
     }
 
-    const messages = await Message.find({ teamId })
+    const messages = await Message.find({ teamId, ...(req.query.after && !isNaN(Date.parse(req.query.after)) ? { createdAt: { $gte: new Date(req.query.after) } } : {}) })
       .populate("senderId", "name email avatar profileImage chatUsername role roleTitle college university")
-      .sort({ createdAt: 1 })
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(500)
       .lean();
 
     return res.json({
@@ -402,7 +412,7 @@ router.get("/:teamId/messages", authenticateUser, async (req, res) => {
       teamId,
       teamName: authCheck.teamName,
       members: authCheck.members,
-      messages,
+      messages: messages.reverse(),
     });
   } catch (err) {
     console.error("Fetch team chat messages error:", err);
@@ -414,7 +424,7 @@ router.get("/:teamId/messages", authenticateUser, async (req, res) => {
 router.post("/:teamId/messages", authenticateUser, async (req, res) => {
   try {
     const { teamId } = req.params;
-    const { text } = req.body;
+    const { text, clientMessageId } = req.body;
 
     const authCheck = await verifyTeamMembership(req.user._id, teamId, req.user.role);
     if (!authCheck.valid) {
@@ -434,6 +444,7 @@ router.post("/:teamId/messages", authenticateUser, async (req, res) => {
       teamId,
       senderId: req.user._id,
       text,
+      clientMessageId,
     });
 
     // Broadcast saved message to other team members via Socket.IO

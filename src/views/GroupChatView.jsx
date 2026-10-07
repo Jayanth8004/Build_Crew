@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import chatApi from '../api/chat';
 import { getSocket } from '../utils/socket';
+import { mergeMessages, subscribeChat } from '../utils/chatSync';
 
 // Curated avatar presets for Group Profile Picture
 const GROUP_AVATAR_PRESETS = [
@@ -71,7 +72,13 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
 
   // UI helpers
   const messagesEndRef = useRef(null);
-  const socketRef = useRef(null);
+  const activeIdRef = useRef(activeGroupId);
+  useEffect(() => { activeIdRef.current = activeGroupId; }, [activeGroupId]);
+  const [loadError, setLoadError] = useState('');
+  const [isLoadingTeams, setIsLoadingTeams] = useState(false);
+  const [isAddingMembers, setIsAddingMembers] = useState(false);
+  const [addMemberIds, setAddMemberIds] = useState([]);
+  const [availableMembers, setAvailableMembers] = useState(null);
   const currentUserId = String(currentUser?._id || currentUser?.id || '');
 
   // 1. Initial groups loading
@@ -85,8 +92,6 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
         setIsLoadingGroups(false);
         if (urlGroupId) {
           setActiveGroupId(urlGroupId);
-        } else if (loaded.length > 0 && !activeGroupId) {
-          setActiveGroupId(loaded[0]._id);
         }
       })
       .catch((err) => {
@@ -100,45 +105,51 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
     return () => {
       isSubscribed = false;
     };
-  }, [urlGroupId, activeGroupId, showToast]);
+  }, [urlGroupId, showToast]);
 
-  // 2. Load Active Group Messages
+  // Subscribe first, then merge history and recovery snapshots with live events.
   useEffect(() => {
     if (!activeGroupId) return;
-
-    let isSubscribed = true;
-    chatApi.getGroupMessages(activeGroupId)
-      .then((res) => {
-        if (!isSubscribed) return;
+    // Reset the visible conversation before subscribing to a different room.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setMessages([]);
+    setActiveGroup(null);
+    setLoadError('');
+    setIsLoadingMessages(true);
+    setAvailableMembers(null);
+    setAddMemberIds([]);
+    return subscribeChat({
+      socket: getSocket(), kind: 'group', id: activeGroupId,
+      load: after => chatApi.getGroupMessages(activeGroupId, after),
+      onData: res => {
         setActiveGroup(res.group);
-        setMessages(res.messages || []);
+        setMessages(previous => mergeMessages(previous, res.messages || []));
         setIsLoadingMessages(false);
-      })
-      .catch((err) => {
-        console.error('Failed to load group messages:', err);
-        if (isSubscribed) {
-          setIsLoadingMessages(false);
-          showToast?.(err.message || 'Could not load messages for this group');
+        setLoadError('');
+      },
+      onError: error => { setLoadError(error.message); setIsLoadingMessages(false); },
+    });
+  }, [activeGroupId]);
+
+  // Keep the group list current, including invitations on serverless hosting.
+  useEffect(() => {
+    let stopped = false;
+    let timer;
+    const refresh = async () => {
+      try {
+        if (!document.hidden) {
+          const res = await chatApi.getGroups();
+          if (!stopped) setGroups(res.groups || []);
         }
-      });
-
-    return () => {
-      isSubscribed = false;
+      } catch { /* Initial load reports errors; retry quietly in the background. */ }
+      if (!stopped) timer = setTimeout(refresh, 5000);
     };
-  }, [activeGroupId, showToast]);
+    timer = setTimeout(refresh, 5000);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, []);
 
-  // 3. Socket.IO Real-time Synchronization
   useEffect(() => {
     const socket = getSocket();
-    socketRef.current = socket;
-
-    if (activeGroupId) {
-      socket.emit('join_group', { groupId: activeGroupId }, (res) => {
-        if (res?.error) {
-          console.warn('[Socket.IO] Join group warning:', res.error);
-        }
-      });
-    }
 
     // Handler for incoming new group message
     const handleNewMessage = (payload) => {
@@ -150,7 +161,7 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
           if (prev.some((m) => String(m._id) === String(incomingMessage._id))) {
             return prev;
           }
-          return [...prev, incomingMessage];
+          return mergeMessages(prev, [incomingMessage]);
         });
       }
 
@@ -187,27 +198,26 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
       if (String(updatedGroup._id) === String(activeGroupId)) {
         setActiveGroup(updatedGroup);
       }
-      setGroups((prev) => prev.map((g) => (String(g._id) === String(updatedGroup._id) ? updatedGroup : g)));
+      setGroups((prev) => [updatedGroup, ...prev.filter(g => String(g._id) !== String(updatedGroup._id))]);
     };
 
     socket.on('new_group_message', handleNewMessage);
     socket.on('group_created', handleGroupCreated);
     socket.on('group_members_updated', handleGroupMembersUpdated);
+    socket.on('group_updated', handleGroupMembersUpdated);
 
     return () => {
-      if (activeGroupId) {
-        socket.emit('leave_group', { groupId: activeGroupId });
-      }
       socket.off('new_group_message', handleNewMessage);
       socket.off('group_created', handleGroupCreated);
       socket.off('group_members_updated', handleGroupMembersUpdated);
+      socket.off('group_updated', handleGroupMembersUpdated);
     };
   }, [activeGroupId, showToast]);
 
   // 4. Auto scroll on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages.length]);
 
   // 5. Send Text-Only Message (Strictly Plain Text, Max 1000 Chars)
   const handleSendMessage = async (e) => {
@@ -220,43 +230,30 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
       return;
     }
 
+    const sendingGroupId = activeGroupId;
+    const pendingId = `pending-${crypto.randomUUID()}`;
+    setMessageText('');
+    setIsSending(true);
+    setMessages(previous => mergeMessages(previous, [{
+      _id: pendingId, clientMessageId: pendingId, text: cleanText, senderId: currentUser,
+      createdAt: new Date().toISOString(), pending: true,
+    }]));
     try {
-      setIsSending(true);
-
-      // Emit through Socket.IO with fallback to REST
-      const socket = socketRef.current || getSocket();
-      let sentViaSocket = false;
-
-      if (socket && socket.connected) {
-        socket.emit(
-          'send_group_message',
-          { groupId: activeGroupId, text: cleanText },
-          (ack) => {
-            if (ack?.success && ack?.message) {
-              setMessages((prev) => {
-                if (prev.some((m) => String(m._id) === String(ack.message._id))) return prev;
-                return [...prev, ack.message];
-              });
-            }
-          }
-        );
-        sentViaSocket = true;
+      // A single HTTP write avoids duplicate sends after a lost socket acknowledgement.
+      // The server broadcasts this same saved message to connected recipients.
+      const res = await chatApi.sendGroupMessage(sendingGroupId, cleanText, pendingId);
+      if (activeIdRef.current === sendingGroupId) {
+        setMessages(previous => mergeMessages(previous.filter(m => m._id !== pendingId), [res.message]));
       }
-
-      if (!sentViaSocket) {
-        const res = await chatApi.sendGroupMessage(activeGroupId, cleanText);
-        if (res?.message) {
-          setMessages((prev) => {
-            if (prev.some((m) => String(m._id) === String(res.message._id))) return prev;
-            return [...prev, res.message];
-          });
-        }
+      setGroups(previous => previous.map(group => String(group._id) === String(sendingGroupId)
+        ? { ...group, lastMessage: { text: cleanText, senderName: currentUser.name, createdAt: res.message.createdAt } }
+        : group));
+    } catch (error) {
+      if (activeIdRef.current === sendingGroupId) {
+        setMessages(previous => previous.filter(m => m._id !== pendingId));
+        setMessageText(previous => previous || cleanText);
       }
-
-      setMessageText('');
-    } catch (err) {
-      console.error('Failed to send group message:', err);
-      showToast?.('Message could not be sent. Please try again.');
+      showToast?.(error.message || 'Message could not be confirmed. Check the chat before retrying.');
     } finally {
       setIsSending(false);
     }
@@ -266,6 +263,7 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
   const handleOpenCreateGroup = async () => {
     try {
       setIsCreateGroupOpen(true);
+      setIsLoadingTeams(true);
       const res = await chatApi.getUserTeams();
       const teams = res.teams || [];
       setUserTeams(teams);
@@ -280,6 +278,8 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
     } catch (err) {
       console.error('Failed to fetch user teams:', err);
       showToast?.('Could not load your formed teams');
+    } finally {
+      setIsLoadingTeams(false);
     }
   };
 
@@ -326,7 +326,7 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
       });
 
       if (res.group) {
-        setGroups((prev) => [res.group, ...prev]);
+        setGroups((prev) => [res.group, ...prev.filter(g => String(g._id) !== String(res.group._id))]);
         setActiveGroupId(res.group._id);
         navigate(`/group-chat/${res.group._id}`);
         showToast?.(`Group "${res.group.name}" created!`);
@@ -342,6 +342,32 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
     } finally {
       setIsCreatingGroup(false);
     }
+  };
+
+  const loadAvailableMembers = async () => {
+    setIsLoadingTeams(true);
+    setAvailableMembers(null);
+    setAddMemberIds([]);
+    try {
+      const res = await chatApi.getUserTeams();
+      const team = res.teams.find(t => String(t.teamId) === String(activeGroup.teamId));
+      const existing = new Set(activeGroup.members.map(m => String(m._id || m)));
+      setAvailableMembers((team?.members || []).filter(m => !existing.has(String(m._id || m))));
+    } catch (error) { showToast?.(error.message || 'Could not load teammates'); }
+    finally { setIsLoadingTeams(false); }
+  };
+
+  const handleAddMembers = async () => {
+    setIsAddingMembers(true);
+    try {
+      const res = await chatApi.addGroupMembers(activeGroupId, addMemberIds);
+      setActiveGroup(res.group);
+      setGroups(previous => previous.map(g => g._id === res.group._id ? res.group : g));
+      setAvailableMembers(null);
+      setAddMemberIds([]);
+      showToast?.('Members added to the group');
+    } catch (error) { showToast?.(error.message || 'Could not add members'); }
+    finally { setIsAddingMembers(false); }
   };
 
   // 7. Save / Update Chat Username
@@ -447,6 +473,7 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
 
   return (
     <div className="flex-1 flex flex-col h-[calc(100vh-4rem)] bg-background text-on-surface overflow-hidden">
+      {loadError && <div role="alert" className="p-3 bg-amber-50 text-amber-900 text-sm">{loadError} — reconnecting automatically.</div>}
       {/* Main Split-Pane Container (WhatsApp Style) */}
       <div className="flex-1 flex w-full h-full overflow-hidden">
         
@@ -637,7 +664,16 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
         {/* RIGHT COLUMN: Active Chat Conversation Pane */}
         {/* =================================================================== */}
         <div className={`flex-1 flex flex-col bg-background h-full overflow-hidden ${!activeGroupId && 'hidden lg:flex'}`}>
-          {!activeGroupId || !activeGroup ? (
+          {activeGroupId && !activeGroup ? (
+            <div className="flex-1 flex flex-col items-center justify-center gap-3 p-6 text-center" role="status">
+              {isLoadingMessages && <span className="material-symbols-outlined animate-spin text-3xl">progress_activity</span>}
+              <p>{loadError ? 'Unable to load this chat. Retrying automatically…' : 'Loading chat…'}</p>
+              <button type="button" className="px-4 py-2 rounded-xl bg-surface-container" onClick={() => {
+                setActiveGroupId(null);
+                navigate('/group-chat');
+              }}>Back to groups</button>
+            </div>
+          ) : !activeGroupId ? (
             /* WhatsApp Web Style Hero Placeholder */
             <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-surface-container-lowest/50">
               <div className="w-20 h-20 rounded-3xl bg-secondary/10 text-secondary flex items-center justify-center mb-4 shadow-inner">
@@ -817,9 +853,9 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
                                 isOwn ? 'text-on-primary/70' : 'text-outline'
                               }`}
                             >
-                              <span>{formatTime(msg.createdAt)}</span>
+                              <span>{msg.pending ? 'Sending…' : formatTime(msg.createdAt)}</span>
                               {isOwn && (
-                                <span className="material-symbols-outlined text-xs">done_all</span>
+                                <span className="material-symbols-outlined text-xs" title={msg.pending ? "Sending" : "Saved"}>{msg.pending ? "schedule" : "check"}</span>
                               )}
                             </div>
                           </div>
@@ -906,7 +942,7 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
                 <label className="block font-title-sm text-xs font-bold text-on-surface mb-1.5">
                   Select Formed Team / Squad <span className="text-error">*</span>
                 </label>
-                {userTeams.length === 0 ? (
+                {isLoadingTeams ? <p role="status">Loading your teammates…</p> : userTeams.length === 0 ? (
                   <div className="p-3 rounded-xl bg-amber-500/10 text-amber-600 text-xs font-semibold">
                     You have not formed or joined any project/hackathon teams yet. Once you join or lead a team, you can create a group for it here!
                   </div>
@@ -1055,7 +1091,7 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
                 </button>
                 <button
                   type="submit"
-                  disabled={isCreatingGroup || !groupName.trim()}
+                  disabled={isCreatingGroup || isLoadingTeams || !selectedTeamId || !groupName.trim()}
                   className="px-5 py-2.5 rounded-xl bg-primary text-on-primary font-title-sm text-sm font-bold shadow-md hover:bg-surface-tint active:scale-95 disabled:opacity-40 transition-all cursor-pointer flex items-center gap-1.5"
                 >
                   {isCreatingGroup ? (
@@ -1188,6 +1224,33 @@ export default function GroupChatView({ currentUser, onUpdateUser, showToast }) 
                   </p>
                 )}
               </div>
+
+              {isCurrentGroupAdmin && activeGroup.teamId && (
+                <section className="space-y-3">
+                  <button type="button" onClick={loadAvailableMembers} disabled={isLoadingTeams || isAddingMembers}
+                    className="px-4 py-2 rounded-xl bg-primary text-on-primary font-semibold disabled:opacity-50">
+                    {isLoadingTeams ? 'Loading teammates…' : 'Add members'}
+                  </button>
+                  {availableMembers && (
+                    <div className="space-y-2">
+                      {availableMembers.length === 0 && <p className="text-sm">All current teammates are already in this group. New teammates will appear here after joining the team.</p>}
+                      {availableMembers.map(member => (
+                        <label key={member._id} className="flex items-center gap-3 p-2 rounded-xl bg-surface-container">
+                          <input type="checkbox" disabled={isAddingMembers} checked={addMemberIds.includes(String(member._id))}
+                            onChange={e => setAddMemberIds(previous => e.target.checked
+                              ? [...previous, String(member._id)] : previous.filter(id => id !== String(member._id)))} />
+                          <span>{member.name}</span>
+                        </label>
+                      ))}
+                      {availableMembers.length > 0 && <button type="button" onClick={handleAddMembers}
+                        disabled={!addMemberIds.length || isAddingMembers}
+                        className="px-4 py-2 rounded-xl bg-primary text-on-primary disabled:opacity-50">
+                        {isAddingMembers ? 'Adding…' : `Add selected (${addMemberIds.length})`}
+                      </button>}
+                    </div>
+                  )}
+                </section>
+              )}
 
               {/* Members Section */}
               <div>
